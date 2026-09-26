@@ -7,7 +7,7 @@ description: >-
 license: MIT
 metadata:
   author: adamanz
-  version: "1.1.0"
+  version: "1.2.0"
   homepage: https://github.com/Kazybekkh/grok-bot-skill
   upstream: https://github.com/adamanz/grok-bot-skill
 ---
@@ -59,6 +59,15 @@ Use `group-create --name NAME --member-name BOT ... --reuse` for 2–6 existing,
 distinct bots. Repeat `--member-id` instead when names are ambiguous. Reuse
 requires the exact name and member set; never silently replace members.
 `group-info --id ID` returns the verified group and member identities.
+
+Use `group-remove-member --id GROUP_ID --member-id BOT_ID` to remove a bot from
+the native room without deleting its profile or conversation history. Repeat
+`--member-id` to remove several bots in one membership update. This is safe to
+repeat when the requested bots are already absent, and the room must retain at
+least one bot. Only remove members within the user's authorized workflow; for
+autonomous withdrawal, a controller must verify that the request came from the
+departing bot's own native author identity. A different bot cannot authorize
+someone else's departure. See [native group details](references/native-groups.md).
 
 For the Last Drop use case, run:
 

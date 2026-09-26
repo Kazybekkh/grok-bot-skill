@@ -1,6 +1,6 @@
 {
   "name": "grok-bot-skill",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "private": true,
   "description": "Community Grok Bot skill for native multi-bot groups and configurable Last Drop merchant/reseller demos",
   "license": "MIT",

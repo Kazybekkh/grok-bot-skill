@@ -40,10 +40,15 @@ class NativeGroupTests(unittest.TestCase):
         self.stack.enter_context(patch.object(grokbot, "_gateway", self.gateway))
         self.connect = self.stack.enter_context(patch.object(grokbot, "_connect", side_effect=self.fake_connect))
         self.stack.enter_context(patch.object(grokbot, "_decrypt_access_token", side_effect=AssertionError("Credential access forbidden in tests")))
+        self.stack.enter_context(patch.object(grokbot, "_native_running", return_value=False))
 
     def fake_connect(self, access, service, method, body):
         if method == "ListGrokBotAgents":
             return {"agents": copy.deepcopy(self.native_agents)}
+        if method == "SetGrokBotRoomMembers":
+            raw = next(agent for agent in self.native_agents if agent["agentId"] == body["agentId"])
+            raw["memberAgentIds"] = list(body["memberAgentIds"])
+            return {"agent": copy.deepcopy(raw)}
         if method in ("CreateGrokBotTemporalAgent", "CreateGrokBotRoom"):
             raw = {"agentId": body["agentId"], "name": body["name"], "description": body["description"],
                    "title": body.get("title", ""), "harness": "temporal", "viewerIsOwner": True,
@@ -61,6 +66,10 @@ class NativeGroupTests(unittest.TestCase):
         self.assertEqual(self.rpc_mutations(), [])
 
     def fake_gateway(self, box, route, body):
+        if route == "/api/setGroupMembers":
+            existing = next(agent for agent in self.agents if agent["id"] == body["id"])
+            existing["memberIds"] = list(body["memberAgentIds"])
+            return copy.deepcopy(existing)
         if route == "/api/createGroup":
             created = room("new-room", body["name"], body["memberAgentIds"])
             self.agents.append(created)
@@ -92,6 +101,127 @@ class NativeGroupTests(unittest.TestCase):
     def demo_bots(self):
         return [bot(role, name, title=title, description=f"Existing instructions for {role}")
                 for role, name, title, _ in grokbot.DEMO_ROLES]
+
+    def remove(self, ids, *, group_id="existing"):
+        return self.output(grokbot.cmd_group_remove_member, SimpleNamespace(id=group_id, name=None, member_id=ids))
+
+    def native_room(self, ids=None):
+        ids = ids or ["a", "b", "c", "d"]
+        for agent in self.agents:
+            agent["harness"] = "temporal"
+            self.native_agents.append({"agentId": agent["id"], "name": agent["name"], "harness": "temporal", "kind": 1, "viewerIsOwner": True})
+        self.agents.append(room("existing", "Demo room", ids, harness="temporal", isRunning=False))
+        self.native_agents.append({"agentId": "existing", "name": "Demo room", "harness": "temporal", "kind": 2, "memberAgentIds": list(ids), "viewerIsOwner": True})
+
+    def test_native_removal_updates_real_membership_and_keeps_bots(self):
+        self.native_room()
+        result = self.remove(["c", "d"])
+        self.assertEqual(result["group"]["memberIds"], ["a", "b"])
+        self.assertEqual(result["removedMemberIds"], ["c", "d"])
+        self.assertTrue(result["removed"])
+        self.assertEqual(len(self.native_agents), 5)
+        mutations = self.rpc_mutations()
+        self.assertEqual(len(mutations), 1)
+        self.assertEqual(mutations[0].args[2:], ("SetGrokBotRoomMembers", {"agentId": "existing", "memberAgentIds": ["a", "b"]}))
+        self.gateway.assert_not_called()
+
+    def test_removal_uses_native_membership_despite_stale_gateway(self):
+        self.native_room()
+        self.native_agents[-1]["memberAgentIds"] = ["a", "b", "d"]
+        result = self.remove(["d"])
+        self.assertEqual(result["group"]["memberIds"], ["a", "b"])
+        self.assertNotIn("c", self.rpc_mutations()[0].args[3]["memberAgentIds"])
+        info = self.output(grokbot.cmd_group_info, SimpleNamespace(id="existing", name=None))
+        self.assertEqual(info["group"]["memberIds"], ["a", "b"])
+        self.assertIs(info["group"]["isRunning"], False)
+
+    def test_box_removal_is_idempotent_and_can_keep_one_member(self):
+        self.agents.append(room("existing", "Demo room", ["a", "b"]))
+        first = self.remove(["b"])
+        self.assertEqual(first["group"]["memberIds"], ["a"])
+        self.assertEqual([member["id"] for member in first["members"]], ["a"])
+        again = self.remove(["b"])
+        self.assertFalse(again["removed"])
+        self.assertEqual(again["alreadyAbsentMemberIds"], ["b"])
+        self.gateway.assert_called_once()
+        info = self.output(grokbot.cmd_group_info, SimpleNamespace(id="existing", name=None))
+        self.assertEqual(info["group"]["memberIds"], ["a"])
+
+    def test_native_already_absent_is_noop_using_fresh_members(self):
+        self.native_room(["a", "b"])
+        result = self.remove(["c"])
+        self.assertFalse(result["removed"])
+        self.assertEqual(result["alreadyAbsentMemberIds"], ["c"])
+        self.assert_no_rpc_mutations()
+        self.gateway.assert_not_called()
+
+    def test_remove_rejects_last_member_unknown_nonowned_and_duplicate_ids(self):
+        self.agents.append(room("existing", "Demo room", ["a", "b"]))
+        for ids in (["a", "b"], ["missing"], ["b", "b"], [], ["existing"]):
+            with self.subTest(ids=ids), self.assertRaises(grokbot.GrokBotError):
+                self.remove(ids)
+        self.agents[1]["viewerIsOwner"] = False
+        with self.assertRaises(grokbot.GrokBotError):
+            self.remove(["b"])
+        self.agents[1]["viewerIsOwner"] = True
+        self.agents[-1]["viewerIsOwner"] = False
+        with self.assertRaises(grokbot.GrokBotError):
+            self.remove(["b"])
+        self.gateway.assert_not_called()
+        self.assert_no_rpc_mutations()
+
+    def test_native_mutation_does_not_fall_back_when_roster_cannot_be_read(self):
+        self.native_room()
+        self.connect.side_effect = OSError("Synthetic unavailable roster")
+        with self.assertRaisesRegex(grokbot.GrokBotError, "could not be read"):
+            self.remove(["b"])
+        self.gateway.assert_not_called()
+        self.assert_no_rpc_mutations()
+
+    def test_native_mutation_rejects_group_missing_from_authoritative_roster(self):
+        self.native_room()
+        self.native_agents.pop()
+        with self.assertRaises(grokbot.GrokBotError):
+            self.remove(["b"])
+        self.gateway.assert_not_called()
+        self.assert_no_rpc_mutations()
+
+    def test_uncertain_removal_reconciles_membership_without_resending(self):
+        self.native_room()
+        def lost_response(access, service, method, body):
+            result = self.fake_connect(access, service, method, body)
+            if method == "SetGrokBotRoomMembers":
+                raise OSError("Synthetic lost removal response")
+            return result
+        self.connect.side_effect = lost_response
+        result = self.remove(["b", "c", "d"])
+        self.assertEqual(result["group"]["memberIds"], ["a"])
+        self.assertEqual(len(self.rpc_mutations()), 1)
+        self.gateway.assert_not_called()
+
+    def test_unconfirmed_removal_is_not_resent_or_reported_as_success(self):
+        self.native_room()
+        def failed_response(access, service, method, body):
+            if method == "SetGrokBotRoomMembers":
+                return {"agent": {**self.native_agents[-1], "agentId": "wrong-room"}}
+            return self.fake_connect(access, service, method, body)
+        self.connect.side_effect = failed_response
+        with self.assertRaisesRegex(grokbot.GrokBotError, "was not resent"):
+            self.remove(["b"])
+        self.assertEqual(len(self.rpc_mutations()), 1)
+        self.gateway.assert_not_called()
+
+    def test_removal_accepts_server_reordering_of_exact_remaining_members(self):
+        self.native_room()
+        def reordered(access, service, method, body):
+            response = self.fake_connect(access, service, method, body)
+            if method == "SetGrokBotRoomMembers":
+                response["agent"]["memberAgentIds"].reverse()
+            return response
+        self.connect.side_effect = reordered
+        result = self.remove(["d"])
+        self.assertEqual(set(result["group"]["memberIds"]), {"a", "b", "c"})
+        self.assertEqual(len(self.rpc_mutations()), 1)
 
     def test_creates_native_group_with_exact_existing_members(self):
         result = self.create(["a", "c", "b"])

@@ -158,6 +158,54 @@ def _safe_error(raw: str) -> str:
     return f"{message}" + (f" ({debug})" if debug else "")
 
 
+def _native_running(access_token: str, agent_id: str) -> bool | None:
+    """Read one authoritative live-state snapshot, then close the native stream.
+
+    Verified against desktop 0.59.1 WatchGrokBotTranscripts and its agentState
+    snapshot. Connect framing: https://connectrpc.com/docs/protocol/.
+    A complete snapshot with no running sessions means idle; a missing snapshot
+    or transport failure means unknown, never idle.
+    """
+    body = json.dumps({"cursors": [{"agentId": agent_id, "generation": 0,
+                                   "afterUpdatedSeq": "0", "sessionId": ""}],
+                       "includeUnlistedAgents": False, "inlineBodyMaxBytes": 0}).encode()
+    request = urllib.request.Request(
+        f"{BACKEND}/aiserver.v1.GrokBotService/WatchGrokBotTranscripts",
+        data=b"\x00" + len(body).to_bytes(4, "big") + body,
+        headers={"Authorization": f"Bearer {access_token}",
+                 "Content-Type": "application/connect+json", "Connect-Protocol-Version": "1",
+                 "Connect-Timeout-Ms": "5000", "x-cursor-client-type": "sand",
+                 "x-cursor-client-version": CLIENT_VERSION, "x-sand-box-namespace": "prod",
+                 "x-ghost-mode": "false"}, method="POST")
+    try:
+        with urllib.request.urlopen(request, timeout=6) as response:
+            def read_exact(size):
+                result = b""
+                while len(result) < size:
+                    part = response.read(size - len(result))
+                    if not part:
+                        raise ValueError("incomplete frame")
+                    result += part
+                return result
+            for _ in range(32):
+                header = read_exact(5)
+                size = int.from_bytes(header[1:], "big")
+                if header[0] != 0 or size > 2 * 1024 * 1024:
+                    return None
+                frame = json.loads(read_exact(size))
+                state = frame.get("agentState")
+                if isinstance(state, dict) and state.get("snapshot") is True:
+                    live = state.get("live", [])
+                    if not isinstance(live, list) or any(not isinstance(row, dict) for row in live):
+                        return None
+                    return any(row.get("agentId") == agent_id and
+                               (row.get("isRunning") is True or row.get("hasRunningSubagents") is True)
+                               for row in live)
+    except (OSError, ValueError, TypeError, AttributeError):
+        return None
+    return None
+
+
 def _ensure_box(access_token: str) -> dict[str, str]:
     box = _connect(access_token, "aiserver.v1.GrokBotService", "EnsureSandBox", {})
     gateway_url = box.get("gatewayUrl") or box.get("gateway_url")
@@ -506,6 +554,8 @@ def cmd_transcript(args: argparse.Namespace) -> None:
     access, box = _session()
     agent = _resolve_agent(box, agent_id=args.id, name=args.name, access=access)
     entries = _read_transcript(access, box, agent, args.limit)
+    if _harness(agent) == "temporal":
+        agent = {**agent, "isRunning": _native_running(access, agent["id"])}
     print(
         json.dumps(
             {
@@ -516,6 +566,7 @@ def cmd_transcript(args: argparse.Namespace) -> None:
                         "kind": entry.get("kind") or entry.get("type"),
                         "author": entry.get("authorId") or entry.get("role") or entry.get("author"),
                         "text": _entry_text(entry),
+                        "streaming": entry.get("streaming") is True,
                     }
                     for entry in entries
                 ],
@@ -626,26 +677,42 @@ def _temporal_agent(raw):
             "viewerIsOwner": raw.get("viewerIsOwner", True)}
 
 
-def _setup_roster(box, access):
-    """Include newly created native agents before the computer's cache catches up."""
+def _setup_roster(box, access, *, strict_native=False):
+    """Use native identities/membership while retaining gateway runtime state."""
     rows = _list_agents(box)
     if not access:
         return rows
     try:
         native = _connect(access, "aiserver.v1.GrokBotService", "ListGrokBotAgents", {})
-        known = {row.get("id") for row in rows}
-        for raw in native.get("agents", []):
-            if raw.get("harness") == "temporal" and raw.get("agentId") not in known:
-                rows.append(_temporal_agent(raw))
-                known.add(raw.get("agentId"))
+        if not isinstance(native, dict) or not isinstance(native.get("agents"), list):
+            raise GrokBotError("Grok returned an invalid native roster.")
+        known = {row.get("id"): index for index, row in enumerate(rows)}
+        native_ids = set()
+        for raw in native["agents"]:
+            if raw.get("harness") != "temporal":
+                continue
+            normalized = _temporal_agent(raw)
+            native_ids.add(normalized["id"])
+            index = known.get(normalized["id"])
+            if index is None:
+                known[normalized["id"]] = len(rows)
+                rows.append(normalized)
+            else:
+                # A gateway cache may still contain a reseller who left. The
+                # control-plane room membership wins; live runtime flags stay.
+                rows[index] = {**rows[index], **normalized}
+        if strict_native:
+            rows = [row for row in rows if row.get("harness") != "temporal" or row.get("id") in native_ids]
     except (GrokBotError, OSError, ValueError, AttributeError):
+        if strict_native:
+            raise GrokBotError("Native group membership could not be read. Retry inspection before changing members.") from None
         pass  # The computer roster remains authoritative for older clients.
     return rows
 
 
-def _members(agents: list[dict[str, Any]], ids: list[str]) -> list[dict[str, Any]]:
-    if not 2 <= len(ids) <= 6 or len(set(ids)) != len(ids):
-        raise GrokBotError("A group needs 2–6 distinct bot IDs.")
+def _members(agents: list[dict[str, Any]], ids: list[str], *, minimum=2) -> list[dict[str, Any]]:
+    if not isinstance(ids, list) or not minimum <= len(ids) <= 6 or not all(isinstance(value, str) and value for value in ids) or len(set(ids)) != len(ids):
+        raise GrokBotError(f"A group needs {minimum}–6 distinct bot IDs.")
     found = {agent.get("id"): agent for agent in agents}
     result = []
     for agent_id in ids:
@@ -726,19 +793,96 @@ def cmd_group_create(args):
         print(json.dumps(result, indent=2))
 
 
-def cmd_group_info(args):
-    access, box = _session()
-    agents = _setup_roster(box, access)
-    if args.id:
-        found = [a for a in agents if a.get("id") == args.id]
+def _group_from_roster(agents, *, agent_id=None, name=None):
+    if agent_id:
+        found = [a for a in agents if a.get("id") == agent_id]
     else:
-        found = [a for a in agents if str(a.get("name") or "").casefold() == str(args.name or "").casefold()]
+        found = [a for a in agents if str(a.get("name") or "").casefold() == str(name or "").casefold()]
     if len(found) != 1 or found[0].get("isGroup") is not True:
         raise GrokBotError("Choose one existing native Grok Bot group.")
     group = found[0]
     _box_owned(group)
-    members = _members(agents, group.get("memberIds") or [])
+    return group
+
+
+def cmd_group_info(args):
+    access, box = _session()
+    agents = _setup_roster(box, access)
+    group = _group_from_roster(agents, agent_id=args.id, name=args.name)
+    if _harness(group) == "temporal":
+        group = {**group, "isRunning": _native_running(access, group["id"])}
+    members = _members(agents, group.get("memberIds") or [], minimum=1)
     print(json.dumps({"group": _summarize_agent(group, full=True), "members": [_summarize_agent(a) for a in members]}, indent=2))
+
+
+def _remove_group_members(access, box, *, agent_id=None, name=None, member_ids):
+    if not isinstance(member_ids, list) or not member_ids or not all(isinstance(value, str) and value for value in member_ids) or len(set(member_ids)) != len(member_ids):
+        raise GrokBotError("Pass distinct existing bot IDs to remove.")
+    agents = _setup_roster(box, access)
+    group = _group_from_roster(agents, agent_id=agent_id, name=name)
+    native = _harness(group) == "temporal"
+    if native:
+        # A mutation must never use only the computer's cached member set.
+        agents = _setup_roster(box, access, strict_native=True)
+        group = _group_from_roster(agents, agent_id=group["id"])
+    members = _members(agents, group.get("memberIds"), minimum=1)
+    _members(agents, member_ids, minimum=1)
+    before = [member["id"] for member in members]
+    removed = [value for value in member_ids if value in before]
+    absent = [value for value in member_ids if value not in before]
+    remaining = [value for value in before if value not in removed]
+    if not remaining:
+        raise GrokBotError("A group must keep at least one bot. The last member cannot leave.")
+
+    def matches_remaining(current):
+        values = current.get("memberIds")
+        return (current.get("id") == group["id"] and current.get("isGroup") is True
+                and isinstance(values, list) and len(values) == len(remaining)
+                and all(isinstance(value, str) for value in values)
+                and set(values) == set(remaining))
+
+    def result(current, current_agents):
+        current_members = _members(current_agents, current.get("memberIds"), minimum=1)
+        return {"group": _summarize_agent(current, full=True),
+                "members": [_summarize_agent(member) for member in current_members],
+                "removed": bool(removed), "removedMemberIds": removed,
+                "alreadyAbsentMemberIds": absent}
+
+    if not removed:
+        return result(group, agents)
+    # Verified against 0.59.1: the native UI sets the remaining membership;
+    # this never deletes bots, messages, or the room itself. Send only once.
+    try:
+        if native:
+            response = _connect(access, "aiserver.v1.GrokBotService", "SetGrokBotRoomMembers",
+                                {"agentId": group["id"], "memberAgentIds": remaining})
+            updated = _temporal_agent(response.get("agent"))
+        else:
+            response = _gateway(box, "/api/setGroupMembers", {"id": group["id"], "memberAgentIds": remaining})
+            updated = _extract_agent(response)
+        if not matches_remaining(updated):
+            raise GrokBotError("The server did not confirm the requested group membership.")
+    except (GrokBotError, OSError, ValueError, AttributeError):
+        # Reconcile only. Replaying a stale replacement list could restore a
+        # participant independently removed by another client.
+        try:
+            fresh_agents = _setup_roster(box, access, strict_native=native)
+            fresh = _group_from_roster(fresh_agents, agent_id=group["id"])
+            if matches_remaining(fresh):
+                return result(fresh, fresh_agents)
+        except (GrokBotError, OSError, ValueError, AttributeError):
+            pass
+        raise GrokBotError("Group member removal could not be confirmed. Inspect the group before retrying; the request was not resent.") from None
+    # The mutation response is the authoritative native room snapshot. Do not
+    # replace it with a lagging gateway record immediately after the write.
+    return result(updated, agents)
+
+
+def cmd_group_remove_member(args):
+    with _setup_lock():
+        access, box = _session()
+        result = _remove_group_members(access, box, agent_id=args.id, name=args.name, member_ids=args.member_id)
+        print(json.dumps(result, indent=2))
 
 
 DEMO_DEFAULTS = {
@@ -906,6 +1050,10 @@ def main() -> None:
     group_info_p = sub.add_parser("group-info", help="Inspect and verify a native group and its members")
     _add_agent_selector(group_info_p)
 
+    remove_member_p = sub.add_parser("group-remove-member", help="Remove existing bots from a native group without deleting them; retain at least one member")
+    _add_agent_selector(remove_member_p)
+    remove_member_p.add_argument("--member-id", action="append", required=True, help="Repeat for each bot to remove")
+
     demo_p = sub.add_parser("setup-demo", help="Create or reuse the four Last Drop teammates and their group; never sends a prompt")
     demo_p.add_argument("--name", default="The Last Drop — Live Negotiation")
     demo_p.add_argument("--config-json", default="{}", help="Lot, integer pence prices/budgets and quantities as JSON")
@@ -921,6 +1069,7 @@ def main() -> None:
         "transcript": cmd_transcript,
         "group-create": cmd_group_create,
         "group-info": cmd_group_info,
+        "group-remove-member": cmd_group_remove_member,
         "setup-demo": cmd_setup_demo,
     }
     try:

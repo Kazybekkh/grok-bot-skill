@@ -12,6 +12,7 @@ python3 scripts/grokbot.py group-create --name "Reseller room" \
   --member-name "Last Drop Merchant" --member-name "Denim Dan" \
   --member-name "Bargain Bea" --member-name "Premium Priya" --reuse
 python3 scripts/grokbot.py group-info --name "Reseller room"
+python3 scripts/grokbot.py group-remove-member --id GROUP_ID --member-id BOT_ID
 python3 scripts/grokbot.py setup-demo --name "Last Drop Demo" \
   --config-json '{"quantity":250,"premiumMaxQuantity":100,"floorPricePence":2400}'
 ```
@@ -21,6 +22,14 @@ python3 scripts/grokbot.py setup-demo --name "Last Drop Demo" \
 include `id`, `name`, `isGroup:true`, `memberIds`, and runtime state when
 available. Each demo member also has `role`. No account-specific IDs are
 embedded in the skill.
+
+`group-remove-member` accepts repeated `--member-id` flags and returns
+`{group,members,removed,removedMemberIds,alreadyAbsentMemberIds}`. It verifies
+ownership and current native membership, removes only specified existing bots,
+and retains at least one member. It never deletes a bot or room. Single-member
+rooms remain inspectable and readable. Repeating removal of an already absent
+member performs no mutation. A departed bot is not silently re-added by setup:
+choose a fresh room name for another complete four-bot round.
 
 Setup uses one sign-in session, suppresses new-bot introductions, leaves reused
 profiles unchanged, and performs no negotiation sends. Repeat setup safely
@@ -41,6 +50,30 @@ Messages retain a stable UUID during uncertain-send status checks. Inline and
 blob-backed transcript bodies are decoded locally; the frontend receives only
 normalized messages with their real authors. The app's private protocol can
 change, so rerun compatibility tests when updating Grok Bot.
+
+`group-info` and `transcript` read a bounded `WatchGrokBotTranscripts` live-state
+snapshot for server-backed agents. This provides current `isRunning` even before
+a newly created room is opened in the desktop app. Transport failures return
+unknown (`null`), never an invented idle state. Transcript rows retain `streaming`
+so consumers can wait for a completed message before acting on its contents.
+
+Membership removal follows the desktop's actual member-removal action:
+GrokBotService `SetGrokBotRoomMembers` receives `agentId` and the remaining
+`memberAgentIds`, and returns the room agent. Older computer-backed rooms use
+`setGroupMembers` with `id` and `memberAgentIds`. The desktop prevents removing
+the final bot; the CLI enforces the same rule. Native membership supersedes
+stale gateway metadata while runtime flags remain available. Native removals
+require a successful fresh control-plane roster read.
+
+Membership writes use the same local process lock as setup. The protocol has
+no verified compare-and-swap version, so avoid concurrent membership edits
+from another client. On a lost or malformed response, the CLI checks the
+authoritative member set and does not resend a stale replacement list.
+
+Autonomous exits are application policy, not a new bot impersonation feature:
+the application must validate a withdrawal against its native author identity,
+or remove non-winning resellers after a human-approved allocation. The CLI
+does not infer approval or withdrawals from free-form chat messages.
 
 Creation and sending are not retried blindly. On an uncertain group creation,
 the CLI checks the roster for exactly one name/member match. If none is verified,

@@ -5,7 +5,7 @@
 
 A community skill for Codex, Claude Code and Cursor to create Grok Bot teammates, form native group conversations, send messages and read their real responses from the terminal.
 
-This **1.1.0 fork** extends [Adam Anzuoni’s original `adamanz/grok-bot-skill`](https://github.com/adamanz/grok-bot-skill), retaining his MIT license and attribution. It adds native group creation and a configurable merchant/reseller setup for [Last Drop](https://lastdrop-nine.vercel.app).
+This **1.2.0 fork** extends [Adam Anzuoni’s original `adamanz/grok-bot-skill`](https://github.com/adamanz/grok-bot-skill), retaining his MIT license and attribution. It adds native group creation, member departures, and a configurable merchant/reseller setup for [Last Drop](https://lastdrop-nine.vercel.app).
 
 ## Install
 
@@ -52,6 +52,17 @@ python3 scripts/grokbot.py group-info --name "Reseller room"
 
 `group-create` returns the group and verified member identities. `--reuse` opens an existing group only when its name and complete member set match. Ambiguous names, different members, non-owned bots and mixed runtimes are rejected instead of silently changing a conversation.
 
+## Remove group members
+
+```bash
+python3 scripts/grokbot.py group-remove-member --id GROUP_ID \
+  --member-id DEPARTING_BOT_ID --member-id ANOTHER_DEPARTING_BOT_ID
+```
+
+This changes native room membership while retaining the bot profiles and chat history. Already absent members are a successful no-op; at least one bot must remain. The JSON result includes the updated `group` and `members`, `removed`, `removedMemberIds`, and `alreadyAbsentMemberIds`. `group-info` and `transcript` continue to work with a single remaining bot. Setup never silently adds departed members back; use a fresh room name for a new full-participant demo.
+
+The CLI provides the membership action; an application controller supplies the authorized decision. For autonomous reseller withdrawal, verify a structured request against that reseller's actual native message author. For closing a deal, the human-selected allocation determines who remains. Do not treat arbitrary conversation text as permission to remove other participants.
+
 ## Set up the Last Drop demo
 
 ```bash
@@ -85,6 +96,7 @@ A freshly created native room can be sent messages and read from the CLI without
 | `transcript` | Read recent messages and author identities |
 | `group-create` | Create or reuse a native group with 2–6 existing bots |
 | `group-info` | Verify a native group and its members |
+| `group-remove-member` | Remove bots from a native room, keeping its history and at least one member |
 | `setup-demo` | Create or reuse the four Last Drop bots and group; return a round brief |
 
 See [SKILL.md](SKILL.md) for agent instructions and [native group details](references/native-groups.md) for protocol behavior and output contracts.

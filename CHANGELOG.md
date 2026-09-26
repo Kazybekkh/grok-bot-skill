@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.2.0 — 2026-09-26
+
+- Add `group-remove-member` for native group departures, including multiple removals, idempotent absence, and last-member protection.
+- Verify native membership against the control plane instead of restoring stale gateway participants.
+- Keep one-member rooms readable after resellers leave; preserve profiles and conversation history.
+- Reconcile uncertain member updates without replaying them. Add mocked ownership, stale roster, and removal regressions.
+
 ## 1.1.0 — 2026-09-26
 
 Community fork at [Kazybekkh/grok-bot-skill](https://github.com/Kazybekkh/grok-bot-skill), based on Adam Anzuoni’s MIT-licensed upstream.

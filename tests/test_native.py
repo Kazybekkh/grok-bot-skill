@@ -28,6 +28,7 @@ class NativeConversationTests(unittest.TestCase):
         self.stack.enter_context(patch.object(grok, "_decrypt_access_token", side_effect=AssertionError("No credentials")))
         self.stack.enter_context(patch.object(grok, "_gateway", side_effect=AssertionError("No gateway")))
         self.connect = self.stack.enter_context(patch.object(grok, "_connect"))
+        self.stack.enter_context(patch.object(grok, "_native_running", return_value=False))
 
     def test_send_uses_native_identity_and_requires_explicit_acceptance(self):
         self.connect.return_value = {"delivery": "GROK_BOT_USER_MESSAGE_DELIVERY_ACCEPTED_TEMPORAL"}
@@ -63,6 +64,21 @@ class NativeConversationTests(unittest.TestCase):
         self.connect.return_value = {"entries": [row(last), row(first)]}
         self.assertEqual(grok._native_transcript("synthetic", "room-id", 80), [first, last])
         self.assertEqual(self.connect.call_args.args[3], {"agentId": "room-id", "limit": 80, "sessionId": ""})
+
+    def test_transcript_preserves_streaming_to_avoid_final_action_loss(self):
+        entries = [
+            {"id": "partial", "kind": "send-message", "author": {"id": "a", "name": "Merchant"}, "text": "Thinking", "streaming": True},
+            {"id": "complete", "kind": "send-message", "author": {"id": "b", "name": "Buyer"}, "text": "Final offer", "streaming": False},
+        ]
+        with patch.object(grok, "_session", return_value=("synthetic", {})), \
+             patch.object(grok, "_resolve_agent", return_value=AGENT), \
+             patch.object(grok, "_read_transcript", return_value=entries):
+            stream = io.StringIO()
+            with contextlib.redirect_stdout(stream):
+                grok.cmd_transcript(SimpleNamespace(id="room-id", name=None, limit=80))
+        result = json.loads(stream.getvalue())
+        self.assertIs(result["entries"][0]["streaming"], True)
+        self.assertIs(result["entries"][1]["streaming"], False)
 
     def test_blob_reads_only_requested_paths_without_exposing_urls(self):
         blob_hash = "a" * 64
@@ -116,3 +132,30 @@ class NativeConversationTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+class NativeRuntimeTests(unittest.TestCase):
+    def response(self, frames):
+        payload = b''
+        for frame in frames:
+            body = json.dumps(frame).encode()
+            payload += b'\x00' + len(body).to_bytes(4, 'big') + body
+        return io.BytesIO(payload)
+
+    def test_complete_snapshot_distinguishes_running_idle_and_other_agents(self):
+        for live, expected in [([], False), ([{'agentId': 'room', 'isRunning': True}], True),
+                               ([{'agentId': 'room', 'hasRunningSubagents': True}], True),
+                               ([{'agentId': 'other', 'isRunning': True}], False)]:
+            with self.subTest(live=live), patch.object(grok.urllib.request, 'urlopen', return_value=self.response([
+                {'connected': {'streamId': 'synthetic'}}, {'agentState': {'snapshot': True, 'live': live}}
+            ])) as request:
+                self.assertIs(grok._native_running('synthetic', 'room'), expected)
+                body = json.loads(request.call_args.args[0].data[5:])
+                self.assertEqual(body['cursors'][0]['agentId'], 'room')
+
+    def test_failure_or_incomplete_snapshot_is_unknown_not_idle(self):
+        with patch.object(grok.urllib.request, 'urlopen', side_effect=TimeoutError()):
+            self.assertIsNone(grok._native_running('synthetic', 'room'))
+        with patch.object(grok.urllib.request, 'urlopen', return_value=self.response([
+            {'agentState': {'snapshot': False, 'live': []}}
+        ])):
+            self.assertIsNone(grok._native_running('synthetic', 'room'))
