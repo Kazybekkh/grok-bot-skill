@@ -1,8 +1,8 @@
 {
   "name": "grok-bot-skill",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "private": true,
-  "description": "Cursor and Agent Skill to chat with Grok Bot teammates and create new Grok Bots from the CLI",
+  "description": "Community Grok Bot skill for native multi-bot groups and configurable Last Drop merchant/reseller demos",
   "license": "MIT",
   "keywords": [
     "agent-skill",
@@ -23,15 +23,29 @@
   "files": [
     "SKILL.md",
     "scripts",
+    "references",
     "examples.md",
-    "AGENTS.md"
+    "AGENTS.md",
+    "README.md",
+    "CHANGELOG.md",
+    "LICENSE"
   ],
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/adamanz/grok-bot-skill.git"
+    "url": "git+https://github.com/Kazybekkh/grok-bot-skill.git"
   },
-  "homepage": "https://github.com/adamanz/grok-bot-skill#readme",
+  "homepage": "https://github.com/Kazybekkh/grok-bot-skill#readme",
   "bugs": {
-    "url": "https://github.com/adamanz/grok-bot-skill/issues"
-  }
+    "url": "https://github.com/Kazybekkh/grok-bot-skill/issues"
+  },
+  "author": {
+    "name": "Adam Anzuoni",
+    "url": "https://github.com/adamanz"
+  },
+  "contributors": [
+    {
+      "name": "Kazybekkh",
+      "url": "https://github.com/Kazybekkh"
+    }
+  ]
 }

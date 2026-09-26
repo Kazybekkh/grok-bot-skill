@@ -1,16 +1,15 @@
 ---
 name: grok-bot
 description: >-
-  Chat with Grok Bot teammates, message a named Grok Bot, create a new Grok Bot,
-  list Grok Bots, read a Grok Bot transcript, or operate the xAI Grok Bot
-  desktop app from Cursor, Claude Code, or Codex instead of the UI. Use when
-  the user mentions Grok Bot, Grok teammates, Reed, Agent Computer, spinning
-  up a new bot, or talking to Grok from the terminal.
+  Create and message Grok Bot teammates and native multi-bot groups, read their
+  transcripts, or set up a Last Drop merchant/reseller demo from the CLI.
+  Use when the user asks to operate Grok Bot or automate its shared conversations.
 license: MIT
 metadata:
   author: adamanz
-  version: "1.0.0"
-  homepage: https://github.com/adamanz/grok-bot-skill
+  version: "1.1.0"
+  homepage: https://github.com/Kazybekkh/grok-bot-skill
+  upstream: https://github.com/adamanz/grok-bot-skill
 ---
 
 # Grok Bot
@@ -53,6 +52,37 @@ A new bot needs:
 Do not create a second bot with the same name unless the user asks. The CLI refuses duplicates unless `--force` is passed.
 
 After create, send one concrete first task with `chat` unless the user only wanted the empty teammate.
+
+## Native groups and Last Drop
+
+Use `group-create --name NAME --member-name BOT ... --reuse` for 2–6 existing,
+distinct bots. Repeat `--member-id` instead when names are ambiguous. Reuse
+requires the exact name and member set; never silently replace members.
+`group-info --id ID` returns the verified group and member identities.
+
+For the Last Drop use case, run:
+
+```bash
+python3 "$SCRIPT" setup-demo --name "Last Drop Demo"
+```
+
+This creates or reuses Last Drop Merchant, Denim Dan, Bargain Bea, Premium Priya,
+and their native group. It returns `group`, `members`, `created`, `config`, and
+an editable `brief`. It does not send a message or start negotiation. Reused
+profiles are never rewritten; current-round constraints belong in the brief.
+Use the returned group ID with `send` only when starting a round is authorized.
+Read all responses through `transcript`; preserve the real author identities.
+
+`--config-json` accepts `product`, `quantity`, `askingPricePence`,
+`floorPricePence`, `denimBudgetPence`, `bargainBudgetPence`,
+`premiumBudgetPence`, and `premiumMaxQuantity`. Prices and budgets are integer
+pence; budgets are ceilings, not bids. Defaults are fictional demo stock.
+
+The CLI uses native routes for both older computer-backed and newer server-backed
+bots. Mixed-runtime groups and non-owned private bots are rejected. Creation is
+serialized locally. Inspect uncertain creation or delivery before retrying;
+the CLI never blindly resends a mutation. See [native group details](references/native-groups.md).
+This community fork is not an official, version-stable Grok Bot SDK.
 
 ## Chat rules
 

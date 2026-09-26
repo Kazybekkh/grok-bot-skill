@@ -2,19 +2,21 @@
   "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
   "name": "grok-bot-skill",
   "owner": {
-    "name": "Adam Anzuoni",
-    "url": "https://github.com/adamanz"
+    "name": "Kazybekkh",
+    "url": "https://github.com/Kazybekkh"
   },
   "metadata": {
-    "description": "Chat with Grok Bot teammates and create new Grok Bots from Cursor, Claude Code, or Codex",
-    "version": "1.0.0"
+    "description": "Native Grok Bot groups and Last Drop demos; community fork of Adam Anzuoni’s MIT-licensed skill",
+    "version": "1.1.0"
   },
   "plugins": [
     {
       "name": "grok-bot",
-      "description": "Chat with xAI Grok Bot teammates and create new Grok Bots via CLI",
+      "description": "Create native Grok Bot groups, configure merchant/reseller demos, and send or read real multi-bot conversations via CLI",
       "source": "./",
-      "skills": ["./"]
+      "skills": [
+        "./"
+      ]
     }
   ]
 }
