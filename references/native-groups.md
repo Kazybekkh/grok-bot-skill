@@ -44,7 +44,11 @@ blob-backed transcript bodies are decoded locally; the CLI emits only
 normalized messages with their real authors. The app's private protocol can
 change, so rerun compatibility tests when updating Grok Bot.
 
-`group-info` and `transcript` read a bounded `WatchGrokBotTranscripts` live-state
+Native transcript reads cap retained blob bodies and combined decoded entry
+data at 8 MiB each. Oversized reads fail with a request to lower `--limit`;
+repeated references to the same blob still count toward decoded entry data.
+
+`group-info`, `transcript`, and `chat` read a bounded `WatchGrokBotTranscripts` live-state
 snapshot for server-backed agents. This provides current `isRunning` even before
 a newly created room is opened in the desktop app. Transport failures return
 unknown (`null`), never an invented idle state. Transcript rows retain `streaming`
@@ -57,6 +61,8 @@ GrokBotService `SetGrokBotRoomMembers` receives `agentId` and the remaining
 the final bot; the CLI enforces the same rule. Native membership supersedes
 stale gateway metadata while runtime flags remain available. Native removals
 require a successful fresh control-plane roster read.
+Inspection and group reuse also reject cached native membership when that read
+fails. The gateway-only fallback remains available for older box-only clients.
 
 Membership writes use the same local process lock as setup. The protocol has
 no verified compare-and-swap version, so avoid concurrent membership edits

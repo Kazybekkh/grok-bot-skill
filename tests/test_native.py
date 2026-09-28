@@ -58,6 +58,28 @@ class NativeConversationTests(unittest.TestCase):
             grok._send_message("synthetic", {}, AGENT, "Draft only")
         self.assertEqual([call.args[2] for call in self.connect.call_args_list], ["SendGrokBotUserMessage", "GetGrokBotSendStatus"])
 
+    def test_reconciled_refusal_is_not_swallowed_as_unknown_delivery(self):
+        for status in (3, "GROK_BOT_SEND_STATUS_REJECTED"):
+            with self.subTest(status=status):
+                self.connect.reset_mock()
+                self.connect.side_effect = [OSError("synthetic failure"), {"status": status}]
+                with self.assertRaisesRegex(grok.GrokBotError, "^Grok Bot refused the message\\.$"):
+                    grok._send_message("synthetic", {}, AGENT, "Draft only")
+                sent, checked = [call.args for call in self.connect.call_args_list]
+                self.assertEqual(checked[2], "GetGrokBotSendStatus")
+                self.assertEqual(sent[3]["messageId"], checked[3]["messageId"])
+
+    def test_failed_or_malformed_status_lookup_stays_unknown_without_resending(self):
+        for response in (OSError("synthetic failure"), grok.GrokBotError("status unavailable"),
+                         ValueError("invalid JSON"), None, [], {}):
+            with self.subTest(response=response):
+                self.connect.reset_mock()
+                self.connect.side_effect = [OSError("synthetic failure"), response]
+                with self.assertRaisesRegex(grok.GrokBotError, "could not be confirmed.*not resent"):
+                    grok._send_message("synthetic", {}, AGENT, "Draft only")
+                self.assertEqual([call.args[2] for call in self.connect.call_args_list],
+                                 ["SendGrokBotUserMessage", "GetGrokBotSendStatus"])
+
     def test_native_transcript_is_chronological_and_preserves_authors(self):
         first = {"id": "user-1", "kind": "message", "authorId": "user", "content": "Begin"}
         last = {"id": "bot-1", "kind": "send-message", "author": {"id": "a", "name": "Merchant"}, "message": {"type": "text", "content": "Offer"}}
@@ -130,8 +152,83 @@ class NativeConversationTests(unittest.TestCase):
         self.assertTrue(json.loads(stream.getvalue())["stillRunning"])
 
 
-if __name__ == "__main__":
-    unittest.main()
+class NativeChatTests(unittest.TestCase):
+    def run_chat(self, states, snapshots, *, before=(), agent=None):
+        clock = [0]
+        def sleep(seconds):
+            clock[0] += seconds
+        reads = [list(before), *snapshots, snapshots[-1] if snapshots else list(before)]
+        with patch.object(grok, "_session", return_value=("synthetic", {})), \
+             patch.object(grok, "_resolve_agent", return_value=agent or AGENT), \
+             patch.object(grok, "_read_transcript", side_effect=reads) as transcript, \
+             patch.object(grok, "_send_message", return_value=True) as send, \
+             patch.object(grok, "_native_running", side_effect=states) as runtime, \
+             patch.object(grok, "_setup_roster", side_effect=AssertionError("Native chat must use live native status")), \
+             patch.object(grok, "_decrypt_access_token", side_effect=AssertionError("No credentials")), \
+             patch.object(grok, "_connect", side_effect=AssertionError("No network")), \
+             patch.object(grok, "_gateway", side_effect=AssertionError("No gateway")), \
+             patch.object(grok.time, "time", side_effect=lambda: clock[0]), \
+             patch.object(grok.time, "sleep", side_effect=sleep):
+            stream = io.StringIO()
+            with contextlib.redirect_stdout(stream):
+                grok.cmd_chat(SimpleNamespace(id="room-id", name=None, prompt="Draft", timeout=len(states), poll=1))
+        send.assert_called_once_with("synthetic", {}, agent or AGENT, "Draft")
+        return json.loads(stream.getvalue()), runtime, transcript
+
+    def reply(self, *, streaming=False, entry_id="reply"):
+        return {"id": entry_id, "kind": "send-message", "text": "Offer",
+                "author": {"id": "a", "name": "Merchant"}, "streaming": streaming}
+
+    def test_server_backed_room_completes_on_authoritative_idle_and_final_reply(self):
+        stale = {**AGENT, "isRunning": True, "isRunningTurn": True, "isComposingMessage": True}
+        result, runtime, transcript = self.run_chat([False], [[self.reply()]], agent=stale)
+        self.assertFalse(result["stillRunning"])
+        self.assertIs(result["agent"]["isRunning"], False)
+        self.assertFalse(result["newEntries"][0]["streaming"])
+        runtime.assert_called_once_with("synthetic", "room-id")
+        self.assertEqual(transcript.call_count, 2)
+
+    def test_running_or_unknown_native_state_never_finishes_on_reply_alone(self):
+        for state in (True, None):
+            with self.subTest(state=state):
+                result, runtime, _ = self.run_chat([state], [[self.reply()]], agent={**AGENT, "isRunning": False})
+                self.assertTrue(result["stillRunning"])
+                self.assertIs(result["agent"]["isRunning"], state)
+                runtime.assert_called_once_with("synthetic", "room-id")
+
+    def test_idle_before_delivery_or_only_old_messages_does_not_finish(self):
+        old = {"entryId": "old", "kind": "send-message", "text": "Previous reply"}
+        for snapshot in ([], [old], [{"id": "user", "kind": "message", "authorId": "user", "text": "Draft"}]):
+            with self.subTest(snapshot=snapshot):
+                result, _, _ = self.run_chat([False], [snapshot], before=[old])
+                self.assertTrue(result["stillRunning"])
+
+    def test_streaming_reply_or_another_streaming_group_member_prevents_completion(self):
+        partial = self.reply(streaming=True)
+        for snapshot in ([partial], [self.reply(entry_id="done"), partial]):
+            with self.subTest(snapshot=snapshot):
+                result, _, _ = self.run_chat([False], [snapshot])
+                self.assertTrue(result["stillRunning"])
+                self.assertTrue(result["newEntries"][-1]["streaming"])
+
+    def test_streaming_update_of_same_entry_waits_for_final_reply(self):
+        result, runtime, transcript = self.run_chat([False, False], [[self.reply(streaming=True)], [self.reply()]])
+        self.assertFalse(result["stillRunning"])
+        self.assertEqual(runtime.call_count, 2)
+        self.assertEqual(transcript.call_count, 3)
+        self.assertFalse(result["newEntries"][0]["streaming"])
+
+    def test_running_group_is_polled_until_authoritative_idle(self):
+        result, runtime, _ = self.run_chat([True, False], [[self.reply()], [self.reply()]])
+        self.assertFalse(result["stillRunning"])
+        self.assertEqual(runtime.call_count, 2)
+
+    def test_zero_timeout_does_not_reuse_cached_idle_flag(self):
+        result, runtime, _ = self.run_chat([], [], agent={**AGENT, "isRunning": False})
+        self.assertTrue(result["stillRunning"])
+        self.assertIsNone(result["agent"]["isRunning"])
+        runtime.assert_not_called()
+
 
 class NativeRuntimeTests(unittest.TestCase):
     def response(self, frames):
@@ -159,3 +256,7 @@ class NativeRuntimeTests(unittest.TestCase):
             {'agentState': {'snapshot': False, 'live': []}}
         ])):
             self.assertIsNone(grok._native_running('synthetic', 'room'))
+
+
+if __name__ == "__main__":
+    unittest.main()

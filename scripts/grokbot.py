@@ -35,6 +35,7 @@ def _client_version() -> str:
 
 
 CLIENT_VERSION = _client_version()
+MAX_TRANSCRIPT_BYTES = 8 * 1024 * 1024
 
 
 class GrokBotError(RuntimeError):
@@ -450,14 +451,15 @@ def _send_message(access, box, agent, prompt):
         # Reconcile this exact send identity. Never repeat the prompt on an
         # uncertain response or generate a second message ID automatically.
         try:
-            status = _connect(access, "aiserver.v1.GrokBotService", "GetGrokBotSendStatus",
-                              {"agentId": agent["id"], "messageId": message_id, "sessionId": ""})
-            if status.get("status") in (2, "GROK_BOT_SEND_STATUS_ACCEPTED"):
-                return True
-            if status.get("status") in (3, "GROK_BOT_SEND_STATUS_REJECTED"):
-                raise GrokBotError("Grok Bot refused the message.")
-        except (GrokBotError, OSError, ValueError, AttributeError):
-            pass
+            response = _connect(access, "aiserver.v1.GrokBotService", "GetGrokBotSendStatus",
+                                {"agentId": agent["id"], "messageId": message_id, "sessionId": ""})
+        except (GrokBotError, OSError, ValueError):
+            response = None
+        status = response.get("status") if isinstance(response, dict) else None
+        if status in (2, "GROK_BOT_SEND_STATUS_ACCEPTED"):
+            return True
+        if status in (3, "GROK_BOT_SEND_STATUS_REJECTED"):
+            raise GrokBotError("Grok Bot refused the message.") from None
         raise GrokBotError("Message delivery could not be confirmed. Inspect the group before retrying; the message was not resent.") from None
     delivery = result.get("delivery") if isinstance(result, dict) else None
     if delivery in (1, 2, 3, "GROK_BOT_USER_MESSAGE_DELIVERY_ACCEPTED_BOX",
@@ -499,6 +501,7 @@ def _native_transcript(access, agent_id, limit=80):
                 raise GrokBotError("Grok returned an invalid transcript object reference.")
             hashes.add(value)
     blobs = {}
+    blob_bytes = 0
     if hashes:
         requested = {"blobs/" + value for value in hashes}
         signed = _connect(access, "aiserver.v1.GrokBotService", "PresignSandBoxStoreReads",
@@ -509,16 +512,33 @@ def _native_transcript(access, agent_id, limit=80):
                 continue
             if not isinstance(instruction.get("url"), str):
                 raise GrokBotError("Grok returned an invalid transcript object URL.")
-            blobs[instruction["relPath"][6:]] = _read_signed_blob(instruction["url"])
+            blob_hash = instruction["relPath"][6:]
+            if blob_hash in blobs:
+                continue
+            body = _read_signed_blob(instruction["url"])
+            blob_bytes += len(body)
+            if blob_bytes > MAX_TRANSCRIPT_BYTES:
+                raise GrokBotError("The transcript is too large. Retry with a smaller --limit.")
+            blobs[blob_hash] = body
     entries = []
+    decoded_bytes = 0
     for row in reversed(rows):
         try:
             if row.get("body") is not None:
+                # Check encoded length before allocating another decoded body.
+                remaining = MAX_TRANSCRIPT_BYTES - decoded_bytes
+                if isinstance(row["body"], (str, bytes)) and len(row["body"]) > 4 * ((remaining + 2) // 3):
+                    raise GrokBotError("The transcript is too large. Retry with a smaller --limit.")
                 raw = base64.b64decode(row["body"], validate=True)
             else:
                 raw = blobs.get(row.get("blobHash"))
             if raw is None:
                 raise ValueError("missing body")
+            # Count every entry, including repeated references to one blob,
+            # before retaining decoded objects in the returned conversation.
+            decoded_bytes += len(raw)
+            if decoded_bytes > MAX_TRANSCRIPT_BYTES:
+                raise GrokBotError("The transcript is too large. Retry with a smaller --limit.")
             entry = json.loads(raw.decode("utf-8"))
             if not isinstance(entry, dict) or not isinstance(entry.get("id"), str) or not isinstance(entry.get("kind"), str):
                 raise ValueError("invalid entry")
@@ -584,24 +604,34 @@ def cmd_chat(args: argparse.Namespace) -> None:
     if not _send_message(access, box, agent, args.prompt):
         raise GrokBotError("sendPrompt was not accepted.")
     deadline = time.time() + args.timeout
-    latest = agent
     native = _harness(agent) == "temporal"
+    # Gateway roster flags are not authoritative for server-backed rooms.
+    latest = {**agent, "isRunning": None} if native else agent
     completion_known = False
+    after = before
     while time.time() < deadline:
         time.sleep(args.poll)
-        agents = _setup_roster(box, access)
-        latest = next((row for row in agents if row.get("id") == agent["id"]), latest)
-        running = bool(latest.get("isRunning") or latest.get("isRunningTurn") or latest.get("isComposingMessage"))
         if native:
             after = _read_transcript(access, box, agent)
+            running = _native_running(access, agent["id"])
+            latest = {**latest, "isRunning": running}
+            new = [entry for entry in after if (entry.get("id") or entry.get("entryId")) not in before_ids]
             replied = any(entry.get("kind") == "send-message" and entry.get("streaming") is not True
-                          and _entry_text(entry) and entry.get("id") not in before_ids for entry in after)
-            completion_known = replied and latest.get("isRunning") is False and not running
+                          and _entry_text(entry) for entry in new)
+            # Idle alone may precede delivery of the accepted message. A final
+            # reply alone may precede the other group members finishing.
+            completion_known = running is False and replied and not any(entry.get("streaming") is True for entry in new)
         else:
+            agents = _setup_roster(box, access)
+            latest = next((row for row in agents if row.get("id") == agent["id"]), latest)
+            running = bool(latest.get("isRunning") or latest.get("isRunningTurn") or latest.get("isComposingMessage"))
             completion_known = not running
         if completion_known:
             break
-    after = _read_transcript(access, box, agent)
+    # Preserve the transcript that was checked against the native idle state.
+    # On timeout, a final read is useful but cannot establish completion itself.
+    if not native or not completion_known:
+        after = _read_transcript(access, box, agent)
     new_entries = [
         entry
         for entry in after
@@ -611,7 +641,7 @@ def cmd_chat(args: argparse.Namespace) -> None:
         json.dumps(
             {
                 "agent": _summarize_agent(latest, full=True),
-                "stillRunning": (native and not completion_known) or bool(
+                "stillRunning": not completion_known if native else bool(
                     latest.get("isRunning") or latest.get("isRunningTurn") or latest.get("isComposingMessage")
                 ),
                 "newEntries": [
@@ -620,6 +650,7 @@ def cmd_chat(args: argparse.Namespace) -> None:
                         "kind": entry.get("kind") or entry.get("type"),
                         "author": entry.get("authorId") or entry.get("role") or entry.get("author"),
                         "text": _entry_text(entry),
+                        "streaming": entry.get("streaming") is True,
                     }
                     for entry in new_entries
                 ],
@@ -678,36 +709,43 @@ def _temporal_agent(raw):
 
 
 def _setup_roster(box, access, *, strict_native=False):
-    """Use native identities/membership while retaining gateway runtime state."""
+    """Use authoritative native membership while retaining gateway runtime state."""
     rows = _list_agents(box)
+    cached_native = any(row.get("harness") == "temporal" for row in rows)
     if not access:
+        if strict_native or cached_native:
+            raise GrokBotError("Native group membership could not be read. A signed-in native session is required.")
         return rows
     try:
         native = _connect(access, "aiserver.v1.GrokBotService", "ListGrokBotAgents", {})
         if not isinstance(native, dict) or not isinstance(native.get("agents"), list):
             raise GrokBotError("Grok returned an invalid native roster.")
-        known = {row.get("id"): index for index, row in enumerate(rows)}
+        # Validate the complete response before merging: a malformed later row
+        # must not expose a partially updated roster or cached native membership.
+        normalized = []
         native_ids = set()
         for raw in native["agents"]:
+            if not isinstance(raw, dict):
+                raise GrokBotError("Grok returned an invalid native roster.")
             if raw.get("harness") != "temporal":
                 continue
-            normalized = _temporal_agent(raw)
-            native_ids.add(normalized["id"])
-            index = known.get(normalized["id"])
-            if index is None:
-                known[normalized["id"]] = len(rows)
-                rows.append(normalized)
-            else:
-                # A gateway cache may still contain a reseller who left. The
-                # control-plane room membership wins; live runtime flags stay.
-                rows[index] = {**rows[index], **normalized}
-        if strict_native:
-            rows = [row for row in rows if row.get("harness") != "temporal" or row.get("id") in native_ids]
-    except (GrokBotError, OSError, ValueError, AttributeError):
-        if strict_native:
-            raise GrokBotError("Native group membership could not be read. Retry inspection before changing members.") from None
-        pass  # The computer roster remains authoritative for older clients.
-    return rows
+            agent = _temporal_agent(raw)
+            if agent["id"] in native_ids:
+                raise GrokBotError("Grok returned duplicate native agent identities.")
+            native_ids.add(agent["id"])
+            normalized.append(agent)
+    except (GrokBotError, OSError, ValueError, TypeError, AttributeError):
+        if strict_native or cached_native:
+            raise GrokBotError("Native group membership could not be read. Retry inspection before using native groups.") from None
+        # Older box-only clients may not support the native roster endpoint.
+        return rows
+    known = {row.get("id"): row for row in rows}
+    # Native rows missing from the authoritative roster must not be reused from
+    # the gateway cache, including read-only inspection and group creation.
+    merged = [row for row in rows if row.get("harness") != "temporal" and row.get("id") not in native_ids]
+    for agent in normalized:
+        merged.append({**known.get(agent["id"], {}), **agent})
+    return merged
 
 
 def _members(agents: list[dict[str, Any]], ids: list[str], *, minimum=2) -> list[dict[str, Any]]:
@@ -759,6 +797,8 @@ def _create_group(box, *, name, description, ids, reuse=False, access=None):
             nonce = str(uuid.uuid4())
             created = _connect(access, "aiserver.v1.GrokBotService", "CreateGrokBotRoom", {
                 "agentId": nonce, "name": name, "description": description, "memberAgentIds": ids, "humanMemberUserIds": []})
+            if not isinstance(created, dict):
+                raise GrokBotError("Native group creation returned an invalid response.")
             candidate = _temporal_agent(created.get("agent"))
             if candidate["id"] != nonce or candidate["isGroup"] is not True:
                 raise GrokBotError("Native group creation returned an unexpected identity.")

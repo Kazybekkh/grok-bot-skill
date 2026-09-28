@@ -49,12 +49,10 @@ class NativeGroupTests(unittest.TestCase):
             raw = next(agent for agent in self.native_agents if agent["agentId"] == body["agentId"])
             raw["memberAgentIds"] = list(body["memberAgentIds"])
             return {"agent": copy.deepcopy(raw)}
-        if method in ("CreateGrokBotTemporalAgent", "CreateGrokBotRoom"):
+        if method == "CreateGrokBotRoom":
             raw = {"agentId": body["agentId"], "name": body["name"], "description": body["description"],
                    "title": body.get("title", ""), "harness": "temporal", "viewerIsOwner": True,
-                   "kind": "GROK_BOT_AGENT_KIND_ROOM" if method == "CreateGrokBotRoom" else "GROK_BOT_AGENT_KIND_AGENT"}
-            if method == "CreateGrokBotRoom":
-                raw["memberAgentIds"] = list(body["memberAgentIds"])
+                   "kind": "GROK_BOT_AGENT_KIND_ROOM", "memberAgentIds": list(body["memberAgentIds"])}
             self.native_agents.append(raw)
             return {"agent": copy.deepcopy(raw)}
         raise AssertionError(f"Unexpected remote RPC: {method}")
@@ -74,14 +72,6 @@ class NativeGroupTests(unittest.TestCase):
             created = room("new-room", body["name"], body["memberAgentIds"])
             self.agents.append(created)
             return {"agent": copy.deepcopy(created)}
-        if route == "/api/createAgent":
-            created = bot(f"created-{len(self.agents)}", body["name"], description=body["description"])
-            self.agents.append(created)
-            return {"agent": copy.deepcopy(created)}
-        if route == "/api/updateAgent":
-            existing = next(agent for agent in self.agents if agent["id"] == body["id"])
-            existing.update(body["profile"])
-            return {"agent": copy.deepcopy(existing)}
         raise AssertionError(f"Unexpected gateway action: {route}")
 
     def output(self, command, args):
@@ -305,6 +295,11 @@ class NativeGroupTests(unittest.TestCase):
 
     def test_temporal_members_use_native_room_rpc_and_roundtrip_identity(self):
         self.agents[0]["harness"] = self.agents[1]["harness"] = "temporal"
+        self.native_agents = [
+            {"agentId": agent["id"], "name": agent["name"], "harness": "temporal",
+             "kind": 1, "viewerIsOwner": True}
+            for agent in self.agents[:2]
+        ]
         result = self.create()
         mutations = self.rpc_mutations()
         self.assertEqual(len(mutations), 1)
@@ -317,6 +312,11 @@ class NativeGroupTests(unittest.TestCase):
 
     def test_temporal_lost_response_reconciles_without_resending(self):
         self.agents[0]["harness"] = self.agents[1]["harness"] = "temporal"
+        self.native_agents = [
+            {"agentId": agent["id"], "name": agent["name"], "harness": "temporal",
+             "kind": 1, "viewerIsOwner": True}
+            for agent in self.agents[:2]
+        ]
         def lost_response(access, service, method, body):
             result = self.fake_connect(access, service, method, body)
             if method == "CreateGrokBotRoom":

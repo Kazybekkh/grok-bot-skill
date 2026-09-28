@@ -15,7 +15,9 @@ from unittest.mock import Mock, patch
 SCRIPT = Path(os.environ.get("GROK_BOT_SCRIPT", str(Path(__file__).resolve().parents[1] / "scripts" / "grokbot.py"))).expanduser()
 spec = importlib.util.spec_from_file_location("grokbot", SCRIPT)
 grokbot = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(grokbot)
+# Import-time version discovery must not inspect the locally installed app.
+with patch.object(Path, "exists", return_value=False):
+    spec.loader.exec_module(grokbot)
 
 # Synthetic ciphertext and plaintext only. No real secret store is read.
 ENCRYPTED = base64.b64encode(b"v10" + b"0" * 16).decode()
@@ -52,8 +54,9 @@ class AuthCompatibilityTests(unittest.TestCase):
             self.decrypt({"cursor-accounts": json.dumps(store), "cursor-access-token": "scoped:v1:test:" + ENCRYPTED})
 
     def test_corrupt_accounts_are_reported_without_contents(self):
-        with self.assertRaisesRegex(grokbot.GrokBotError, "account storage is invalid"):
+        with self.assertRaisesRegex(grokbot.GrokBotError, "account storage is invalid") as raised:
             self.decrypt({"cursor-accounts": "private-invalid-contents"})
+        self.assertNotIn("private-invalid-contents", str(raised.exception))
 
     def test_invalid_envelopes_are_rejected(self):
         for value in ("scoped:v1:missing-delimiter", "not-base64", base64.b64encode(b"plaintext").decode()):
